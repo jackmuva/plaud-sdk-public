@@ -31,6 +31,7 @@ There are three frameworks plus one resource bundle:
 4. [WiFi fast transfer (PlaudWiFiAgent)](#4-wifi-fast-transfer-plaudwifiagent)
 5. [Firmware / OTA update](#5-firmware--ota-update)
 6. [Cloud AI — PlaudWorkflowManager & transcription](#6-cloud-ai--plaudworkflowmanager--transcription)
+6a. [Partner device authentication (sn-sign / gen-key / sn-verify)](#6a-partner-device-authentication-sn-sign--gen-key--sn-verify)
 7. [File upload & device binding (PlaudFileUploader)](#7-file-upload--device-binding-plaudfileuploader)
 8. [Domain / region & localization](#8-domain--region--localization)
 9. [Encryption & end-to-end audio decryption](#9-encryption--end-to-end-audio-decryption)
@@ -476,14 +477,123 @@ Key request / result types:
 - **Task types:** `WorkflowTaskType` (`audioTranscribe`, `aiSummarize`, `aiEtl`, `audioMerge`, `custom`, `unknown`)
 - **Errors:** `WorkflowError`, `WorkflowResult<T>` (`.success`/`.failure`), `WorkflowParsingError`
 
-`PlaudPartnerApiManager` (`getPartnerApiManager()`) handles partner-level signing:
+See [section 6a](#6a-partner-device-authentication-sn-sign--gen-key--sn-verify) for
+`PlaudPartnerApiManager`, which wraps the partner SDK auth endpoints.
+
+---
+
+## 6a. Partner device authentication (`sn-sign` / `gen-key` / `sn-verify`)
+
+`PlaudPartnerApiManager` (reached via `PlaudDeviceAgent.shared.getPartnerApiManager()` or
+`PlaudPartnerApiManager.shared`) wraps three partner-only backend endpoints under
+`{customDomain}/developer/api/open/partner/sdk/`. All three are authenticated with the
+**per-user JWT** (`USER_ACCESS_TOKEN`) — the same token you pass to `initSDK` — sent as a
+Bearer header:
+
+| Endpoint | Purpose | iOS surface |
+|----------|---------|-------------|
+| `…/sdk/sn-sign` | Sign a device serial number so the device will accept this app as an authorized partner peer during the BLE handshake. | `signDeviceSn(deviceType:sn:)` |
+| `…/sdk/gen-key` | Generate an RSA key pair used for **end-to-end (E2EE) audio encryption** — the public key is provisioned to the device, the private key stays on the client to decrypt exported audio. | `generateRsaKeyPair()` |
+| `…/sdk/sn-verify` | Verify a signed SN. **Called internally by the SDK** during the handshake; there is no public iOS method for it. | *(internal)* |
 
 ```swift
-func setUserAccessToken(_ token: String?)
-func getUserAccessToken() -> String?
-func signDeviceSn(deviceType: String, sn: String, completion: (Result<PlaudPartnerSnSignResponse, Error>) -> Void)
-func generateRsaKeyPair(completion: (Result<PlaudPartnerGenKeyResponse, Error>) -> Void)
+@_hasMissingDesignatedInitializers final public class PlaudPartnerApiManager {
+    static let shared: PlaudPartnerApiManager
+    func setUserAccessToken(_ token: String?)
+    func getUserAccessToken() -> String?
+
+    // → POST …/open/partner/sdk/sn-sign
+    func signDeviceSn(deviceType: String, sn: String,
+                      completion: @escaping (Result<PlaudPartnerSnSignResponse, Error>) -> Void)
+
+    // → POST …/open/partner/sdk/gen-key
+    func generateRsaKeyPair(
+        completion: @escaping (Result<PlaudPartnerGenKeyResponse, Error>) -> Void)
+}
 ```
+
+Request / response types (all `Codable`):
+
+```swift
+struct PlaudPartnerSnSignRequest  { let type: String; let sn: String }
+struct PlaudPartnerSnSignResponse { let signature: String? }          // sn-sign result
+struct PlaudPartnerGenKeyResponse { let publicKey: String?            // gen-key result
+                                    let privateKey: String? }         //   (PEM strings)
+struct PlaudPartnerApiErrorResponse { let detail: String? }
+
+enum PlaudPartnerApiError: Error, LocalizedError {
+    case invalidParameter(String), noUserAccessToken, invalidURL(String),
+         invalidResponse, unauthorized(detail: String?),
+         serverError(code: Int, body: String?),
+         requestEncodeFailed(Error), responseDecodeFailed(Error), networkError(Error)
+}
+```
+
+### How to use them
+
+**You normally don't have to.** When you initialize with the per-user JWT flow
+(`initSDK(userAccessToken:customDomain:)`), the facade drives `sn-sign` (and the internal
+`sn-verify`) automatically as part of connect/handshake, and it **caches the `sn-sign`
+signature per device serial number** so repeat connections don't re-hit the backend. Call
+these methods directly only for advanced flows — pre-provisioning a device, custom
+handshake orchestration, or generating E2EE keys ahead of time.
+
+The one signature that maps to `type` is the device family; use
+[`PlaudFileUploader.calculateSnType(sn:)`](#7-file-upload--device-binding-plaudfileuploader)
+to derive it from a serial number (SN prefixes: `881` = NotePro, `883` = NotePinS).
+
+**1. Sign a device SN (`sn-sign`)** — authorize a specific device for this partner/user:
+
+```swift
+let api = PlaudDeviceAgent.shared.getPartnerApiManager()
+// (setUserAccessToken is already done by initSDK; set it explicitly only if you
+//  construct the manager before init.)
+let sn = bleDevice.serialNumber
+api.signDeviceSn(deviceType: PlaudFileUploader.calculateSnType(sn: sn), sn: sn) { result in
+    switch result {
+    case .success(let resp):
+        guard let signature = resp.signature else { return }   // nil ⇒ backend rejected
+        // The SDK caches & replays this during the BLE handshake; you rarely
+        // need to hold onto it yourself.
+    case .failure(let error):
+        // e.g. PlaudPartnerApiError.unauthorized(detail:) if the JWT is bad/expired
+        print("sn-sign failed:", error.localizedDescription)
+    }
+}
+```
+
+**2. Generate an RSA key pair (`gen-key`)** — set up end-to-end audio encryption:
+
+```swift
+api.generateRsaKeyPair { result in
+    switch result {
+    case .success(let keys):
+        guard let privatePem = keys.privateKey, let _ = keys.publicKey else { return }
+        // • publicKey  → provisioned to the device so it can encrypt audio to you.
+        // • privateKey → keep it safe on the client; it is required to decrypt
+        //   E2EE audio you later export (see section 9):
+        //
+        //     let out = try AudioFileDecryptor.decryptAudioFile(
+        //         inputPath: encryptedPath, privateKeyPem: privatePem)
+        //
+        //   Store the private key securely (e.g. Keychain). If you lose it,
+        //   previously-encrypted recordings become unrecoverable.
+    case .failure(let error):
+        print("gen-key failed:", error.localizedDescription)
+    }
+}
+```
+
+> **`sn-verify` is internal.** The device-side/verification half of the SN handshake is
+> performed by the SDK itself; it is not part of the public iOS API. It surfaces as an
+> endpoint path only in the Android build. If a connection fails at the auth stage, look at
+> the handshake callbacks (`blePenState` `keyState` / `bleAppKeyState`) rather than calling
+> a verify method.
+
+> **Auth model recap.** These endpoints use the **per-user JWT**, *not* the
+> `PLAUD_CLIENT_ID` / `PLAUD_API_KEY` pair — those two are only for the transcription API.
+> See [section 9](#9-encryption--end-to-end-audio-decryption) for how the `gen-key` private
+> key feeds RSA-wrapped (E2EE) audio decryption.
 
 ---
 
@@ -553,7 +663,10 @@ class PlaudLocalizationManager {     // .shared
 ## 9. Encryption & end-to-end audio decryption
 
 Device audio may be end-to-end encrypted. Decryption helpers live as extensions on
-`BleAgent` and as standalone classes.
+`BleAgent` and as standalone classes. The RSA key pair used for E2EE is minted by the
+`gen-key` endpoint — see
+[section 6a](#6a-partner-device-authentication-sn-sign--gen-key--sn-verify); the
+`privateKey` PEM it returns is what you pass as `privateKeyPem` below.
 
 ```swift
 // On BleAgent — secure channel info:
